@@ -1,0 +1,495 @@
+# -*- coding: utf-8 -*-
+"""
+Atividade Extensionista - Tópicos de Big Data em Python 2026.2 (Estácio Niterói)
+Tema: Análise de Violência Doméstica e Identificação de Feminicídios em Niterói
+Fonte: ISP-RJ (Instituto de Segurança Pública) - https://www.ispdados.rj.gov.br
+
+Estrutura (cada bloco "# %%" é uma célula no Google Colab / VS Code):
+  1. Configuração e carga dos dados (download com timeout + upload manual no Colab)
+  2. Limpeza (pipeline 1)
+  3. Estatísticas descritivas e desvio padrão
+  4. Outliers (boxplot/IQR e z-score)
+  5. Regressão linear simples + projeção
+  6. Identificação de meses críticos de feminicídio (índice de alerta)
+  7. (Opcional) Mesma agregação em PySpark
+  8. Tabelas finais organizadas
+  9. Exportação (CSV + Excel com uma aba por tabela)
+"""
+
+# %% 1. CONFIGURAÇÃO E CARGA ---------------------------------------------------
+import os
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# URLs públicas dos dados mensais por município do ISP-RJ.
+# CONFIRME no site (ispdados.rj.gov.br > Dados Abertos) se o nome do arquivo
+# continua o mesmo. O site do ISP costuma NÃO responder a servidores do Colab
+# (erro "Connection timed out"); nesse caso o código pede o upload manual do CSV.
+URLS_ISP = [
+    "https://www.ispdados.rj.gov.br/Arquivos/BaseMunicipioMensal.csv",
+    "http://www.ispdados.rj.gov.br/Arquivos/BaseMunicipioMensal.csv",
+]
+ARQUIVO_LOCAL = "BaseMunicipioMensal.csv"
+MUNICIPIO = "niteroi"          # comparado sem acento e em minúsculas
+ANO_INICIAL = 2018             # período analisado (use só anos completos)
+ANO_FINAL = 2025               # 2026 fica de fora por estar incompleto
+PASTA_SAIDA = "saida"
+MOSTRAR_COLUNAS = False        # True imprime a lista completa de colunas da base
+os.makedirs(PASTA_SAIDA, exist_ok=True)
+
+
+def sem_acento(txt):
+    """Remove acentos e padroniza para minúsculas (ex.: 'Niterói' -> 'niteroi')."""
+    txt = unicodedata.normalize("NFKD", str(txt))
+    return "".join(c for c in txt if not unicodedata.combining(c)).strip().lower()
+
+
+def etapa(txt):
+    """Título de etapa no console, para o log ficar organizado."""
+    print(f"\n>>> {txt}")
+
+
+def log(msg):
+    print(f"    - {msg}")
+
+
+def baixar_isp(timeout=(10, 60)):
+    """Tenta baixar o CSV do ISP sem travar (timeout curto). Retorna True se salvou o arquivo."""
+    import requests
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    for url in URLS_ISP:
+        try:
+            log(f"Tentando baixar: {url}")
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            with open(ARQUIVO_LOCAL, "wb") as f:
+                f.write(r.content)
+            log("Download concluído.")
+            return True
+        except Exception as e:
+            log(f"Falhou ({type(e).__name__}).")
+    return False
+
+
+def pedir_upload_colab():
+    """No Colab, abre a janela para enviar o CSV baixado manualmente pelo navegador."""
+    try:
+        from google.colab import files
+    except ImportError:
+        return False
+    print("\n    Não foi possível baixar automaticamente.")
+    print("    1) Baixe o CSV em https://www.ispdados.rj.gov.br (Dados Abertos) pelo seu navegador;")
+    print("    2) Envie o arquivo na janela abaixo.\n")
+    enviado = files.upload()
+    if not enviado:
+        return False
+    nome = next(iter(enviado))
+    with open(ARQUIVO_LOCAL, "wb") as f:
+        f.write(enviado[nome])
+    return True
+
+
+def carregar_base():
+    """Usa o CSV local (se existir); senão baixa do ISP; senão pede upload. O ISP usa ';' e latin-1."""
+    if not os.path.exists(ARQUIVO_LOCAL):
+        if not baixar_isp() and not pedir_upload_colab():
+            raise FileNotFoundError(
+                f"Coloque o CSV do ISP na mesma pasta do código com o nome '{ARQUIVO_LOCAL}'.")
+    for enc in ("latin-1", "utf-8"):
+        try:
+            return pd.read_csv(ARQUIVO_LOCAL, sep=None, engine="python", encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError("Não foi possível ler a base: " + ARQUIVO_LOCAL)
+
+
+etapa("1. Carga dos dados")
+df_bruto = carregar_base()
+log(f"Base bruta: {df_bruto.shape[0]:,} linhas x {df_bruto.shape[1]} colunas".replace(",", "."))
+
+# %% 2. LIMPEZA (PIPELINE 1) ---------------------------------------------------
+etapa("2. Limpeza (pipeline 1)")
+df = df_bruto.copy()
+df.columns = [sem_acento(c).replace(" ", "_") for c in df.columns]   # nomes padronizados
+if MOSTRAR_COLUNAS:
+    print("Colunas disponíveis:\n", list(df.columns))   # >>> confira aqui os nomes reais <<<
+
+# Descobre automaticamente as colunas (o ISP às vezes muda nomes entre versões).
+def achar(candidatas, obrigatoria=True):
+    for c in candidatas:
+        if c in df.columns:
+            return c
+    if obrigatoria:
+        raise KeyError(f"Nenhuma de {candidatas} está na base. Veja a lista de colunas acima.")
+    return None
+
+
+COL_MUN = achar(["fmun", "munic", "municipio", "fmun_nome"])
+COL_ANO = achar(["ano", "fano"])
+COL_MES = achar(["mes", "fmes"])
+
+# Indicadores de violência doméstica (proxies) e feminicídio (se existir na base)
+INDICADORES = {
+    "lesao_corporal": achar(["lesao_corp_dolosa", "lesao_corporal_dolosa"], False),
+    "ameaca": achar(["ameaca"], False),
+    "estupro": achar(["estupro"], False),
+    "homicidio_doloso": achar(["hom_doloso", "homicidio_doloso"], False),
+    "feminicidio": achar(["feminicidio", "feminicidios", "feminicidio_consumado"], False),
+}
+INDICADORES = {k: v for k, v in INDICADORES.items() if v}
+log("Indicadores usados: " + ", ".join(f"{k} <- {v}" for k, v in INDICADORES.items()))
+
+# 2.1 filtra Niterói
+df = df[df[COL_MUN].map(sem_acento) == MUNICIPIO].copy()
+assert len(df) > 0, "Nenhuma linha de Niterói encontrada. Verifique COL_MUN."
+
+# 2.2 cria coluna de data (1º dia do mês)
+df["ano"] = pd.to_numeric(df[COL_ANO], errors="coerce")
+df["mes"] = pd.to_numeric(df[COL_MES], errors="coerce")
+df = df.dropna(subset=["ano", "mes"])
+df["data"] = pd.to_datetime(dict(year=df["ano"].astype(int), month=df["mes"].astype(int), day=1))
+
+# 2.2b filtra o período definido na configuração
+df = df[(df["data"].dt.year >= ANO_INICIAL) & (df["data"].dt.year <= ANO_FINAL)].copy()
+assert len(df) > 0, "Nenhum dado no período escolhido. Ajuste ANO_INICIAL / ANO_FINAL."
+
+# 2.3 converte indicadores para número; valores negativos são inválidos -> NaN
+for nome, col in INDICADORES.items():
+    df[nome] = pd.to_numeric(df[col], errors="coerce")
+    df.loc[df[nome] < 0, nome] = np.nan
+
+# 2.4 remove duplicatas e ordena no tempo; 1 linha por mês
+df = (df.groupby("data", as_index=False)[list(INDICADORES)].sum(min_count=1)
+        .sort_values("data").reset_index(drop=True))
+
+# 2.5 trata ausentes: interpolação linear no tempo (e relata quantos eram)
+# Só interpolamos séries com poucos ausentes (<=10%). Séries com muitos ausentes (indicador que
+# só passou a ser registrado depois) NÃO são preenchidas: preencher criaria zeros falsos.
+ausentes = df[list(INDICADORES)].isna().sum()
+INCOMPLETAS = [c for c in INDICADORES if ausentes[c] / len(df) > 0.10]
+for c in INDICADORES:
+    if ausentes[c] > 0:
+        log(f"{c}: {ausentes[c]} meses ausentes de {len(df)} - " +
+            ("série incompleta, mantida SEM preenchimento" if c in INCOMPLETAS else "preenchidos por interpolação"))
+completas = [c for c in INDICADORES if c not in INCOMPLETAS]
+df[completas] = df[completas].interpolate(limit_direction="both")
+
+# Indicadores "raros": mais de 80% dos meses com valor zero (ex.: feminicídio mensal).
+# Para eles, média/z-score/regressão mensal enganam; tratamos separadamente.
+RAROS = [c for c in INDICADORES if (df[c].dropna() == 0).mean() > 0.80]
+LIMITADOS = sorted(set(RAROS) | set(INCOMPLETAS))   # indicadores que exigem cautela
+for c in LIMITADOS:
+    validos = df[c].notna().sum()
+    nz = df.loc[df[c] > 0, "data"]
+    motivo = " e ".join(m for m, lista in (("evento raro (>80% zeros)", RAROS),
+                                           ("série incompleta", INCOMPLETAS)) if c in lista)
+    log(f"{c}: {motivo}; {validos} meses com dado; {len(nz)} com registro >0"
+        + (f"; primeiro em {nz.min():%m/%Y}" if len(nz) else ""))
+
+# Índice composto de violência doméstica (proxy): lesão + ameaça + estupro
+base_dom = [c for c in ("lesao_corporal", "ameaca", "estupro") if c in df.columns]
+df["violencia_domestica_proxy"] = df[base_dom].sum(axis=1)
+df["t"] = np.arange(len(df))     # variável X da regressão (0,1,2,... meses)
+log(f"Período analisado: {df['data'].min():%m/%Y} a {df['data'].max():%m/%Y} ({len(df)} meses)")
+
+# %% 3. ESTATÍSTICAS DESCRITIVAS E DESVIO PADRÃO --------------------------------
+etapa("3. Estatísticas descritivas e desvio padrão")
+colunas_num = list(INDICADORES) + ["violencia_domestica_proxy"]
+desc = df[colunas_num].describe().T
+desc["variancia"] = df[colunas_num].var()
+desc["coef_variacao_%"] = 100 * df[colunas_num].std() / df[colunas_num].mean()
+desc["assimetria"] = df[colunas_num].skew()
+# (as estatísticas descritivas são exibidas na Tabela 1, seção 8)
+
+# Desvio padrão por ano (a variabilidade mudou ao longo do tempo?)
+dp_ano = df.groupby(df["data"].dt.year)[colunas_num].std().round(2)
+dp_ano.insert(0, "meses", df.groupby(df["data"].dt.year).size())   # ano parcial tem < 12
+# (o desvio padrão por ano é exibido na Tabela 5, seção 8)
+
+# Desvio padrão móvel de 12 meses (janela deslizante)
+df["dp_movel_12m"] = df["violencia_domestica_proxy"].rolling(12).std()
+
+fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+ax[0].plot(df["data"], df["violencia_domestica_proxy"], color="#6a3d9a")
+ax[0].set_title("Violência doméstica (proxy) - Niterói, mensal")
+ax[0].set_ylabel("Ocorrências")
+ax[1].plot(df["data"], df["dp_movel_12m"], color="#e31a1c")
+ax[1].set_title("Desvio padrão móvel (12 meses)")
+plt.tight_layout()
+plt.savefig(f"{PASTA_SAIDA}/01_serie_e_desvio_padrao.png", dpi=150)
+plt.close()
+
+# %% 4. OUTLIERS (BOXPLOT/IQR E Z-SCORE) ---------------------------------------
+etapa("4. Outliers (boxplot/IQR e z-score)")
+def outliers_iqr(s):
+    q1, q3 = s.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    if iqr == 0:            # maioria zerada: qualquer valor > 0 viraria "outlier"
+        return pd.Series(False, index=s.index)
+    return (s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)
+
+
+def outliers_z(s, limite=3):
+    z = (s - s.mean()) / s.std(ddof=0)
+    return z.abs() > limite, z
+
+
+resumo_out = []
+for c in colunas_num:
+    flag_iqr = outliers_iqr(df[c])
+    flag_z, z = outliers_z(df[c])
+    df[f"{c}_out_iqr"], df[f"{c}_zscore"], df[f"{c}_out_z"] = flag_iqr, z, flag_z
+    resumo_out.append({"indicador": c, "outliers_IQR": int(flag_iqr.sum()),
+                       "outliers_zscore>3": int(flag_z.sum()),
+                       "observacao": "evento raro/série incompleta: cautela" if c in LIMITADOS else ""})
+# (o resumo de outliers é exibido na Tabela 2, seção 8)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.boxplot([df[c] for c in colunas_num], showfliers=True)
+ax.set_xticklabels(colunas_num)
+ax.set_title("Boxplot dos indicadores - Niterói")
+plt.xticks(rotation=25)
+plt.tight_layout()
+plt.savefig(f"{PASTA_SAIDA}/02_boxplot_outliers.png", dpi=150)
+plt.close()
+
+# %% 5. REGRESSÃO LINEAR SIMPLES -----------------------------------------------
+etapa("5. Regressão linear simples")
+RESULTADOS_REG = []   # guarda os resultados para a tabela final
+
+
+def regressao(x, y, nome):
+    """y = a*x + b via mínimos quadrados (scipy.stats.linregress)."""
+    r = stats.linregress(x, y)
+    log(f"{nome}: a={r.slope:.4f} | b={r.intercept:.2f} | R²={r.rvalue**2:.3f} | p={r.pvalue:.4g}")
+    RESULTADOS_REG.append({"Modelo": nome, "Inclinação (a)": r.slope, "Intercepto (b)": r.intercept,
+                           "R²": r.rvalue ** 2, "p-valor": r.pvalue,
+                           "Significativo (p<0,05)": "Sim" if r.pvalue < 0.05 else "Não"})
+    return r
+
+
+# 5.1 Tendência temporal: ocorrências / tempo (meses)
+r_tempo = regressao(df["t"], df["violencia_domestica_proxy"], "tendência violência doméstica")
+log(f"Variação estimada: {r_tempo.slope:+.2f} ocorrências por mês, a cada mês que passa "
+      f"({12 * r_tempo.slope:+.1f} por ano)")
+
+# 5.2 Projeção dos próximos 12 meses
+futuro_t = np.arange(len(df), len(df) + 12)
+proj = r_tempo.intercept + r_tempo.slope * futuro_t
+datas_fut = pd.date_range(df["data"].iloc[-1] + pd.offsets.MonthBegin(1), periods=12, freq="MS")
+
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.plot(df["data"], df["violencia_domestica_proxy"], label="Observado")
+ax.plot(df["data"], r_tempo.intercept + r_tempo.slope * df["t"], "r--", label="Reta de regressão")
+ax.plot(datas_fut, proj, "g:", label="Projeção 12 meses")
+ax.legend(); ax.set_title(f"Regressão linear simples (R² = {r_tempo.rvalue**2:.2f})")
+plt.tight_layout()
+plt.savefig(f"{PASTA_SAIDA}/03_regressao_tendencia.png", dpi=150)
+plt.close()
+
+# 5.3 Relação entre indicadores: feminicídio / lesão corporal (se existir)
+if "feminicidio" in df.columns and "lesao_corporal" in df.columns and "feminicidio" not in LIMITADOS:
+    r_fem = regressao(df["lesao_corporal"], df["feminicidio"], "feminicídio ~ lesão corporal")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(df["lesao_corporal"], df["feminicidio"], alpha=.6)
+    xs = np.linspace(df["lesao_corporal"].min(), df["lesao_corporal"].max(), 50)
+    ax.plot(xs, r_fem.intercept + r_fem.slope * xs, "r-")
+    ax.set_xlabel("Lesão corporal dolosa"); ax.set_ylabel("Feminicídios")
+    plt.tight_layout()
+    plt.savefig(f"{PASTA_SAIDA}/04_regressao_fem_vs_lesao.png", dpi=150)
+    plt.close()
+
+if "feminicidio" in LIMITADOS:
+    log("Regressão feminicídio ~ lesão corporal NÃO realizada: série rara/incompleta "
+        "(use a série ANUAL ou outra base - ver relatório).")
+
+# %% 6. IDENTIFICAÇÃO DE MESES CRÍTICOS (ÍNDICE DE ALERTA) ---------------------
+etapa("6. Identificação de meses críticos (índice de alerta)")
+# IMPORTANTE: a base é AGREGADA (contagem por mês). Não identifica casos
+# individuais; "identificar feminicídios" aqui = detectar períodos atípicos.
+z_cols = [f"{c}_zscore" for c in base_dom]     # feminicídio fica de fora (evento raro)
+df["indice_alerta"] = df[z_cols].mean(axis=1)           # média dos z-scores
+df["nivel_alerta"] = pd.cut(df["indice_alerta"], [-np.inf, 1, 2, np.inf],
+                            labels=["normal", "atenção", "crítico"])
+# (a contagem por nível de alerta é exibida na Tabela 4, seção 8)
+
+if "feminicidio" in df.columns and "homicidio_doloso" in df.columns:
+    # Proporção de feminicídios entre homicídios dolosos (evita dividir por zero)
+    df["prop_feminicidio_%"] = 100 * df["feminicidio"] / df["homicidio_doloso"].replace(0, np.nan)
+
+if "feminicidio" in df.columns:
+    # Feminicídio: sinaliza meses com ao menos 1 registro e soma por ano
+    df["mes_com_feminicidio"] = df["feminicidio"] > 0
+    fem_ano = df.groupby(df["data"].dt.year)["feminicidio"].agg(
+        [lambda x: x.sum(min_count=1), "max"])    # ano sem dado fica "-" (não vira 0)
+    fem_ano.columns = ["Total no ano", "Máx. em um mês"]
+    fem_ano.index.name = "Ano"
+
+criticos = df[df["nivel_alerta"] == "crítico"][["data"] + colunas_num + ["indice_alerta"]]
+
+fig, ax = plt.subplots(figsize=(11, 4))
+ax.bar(df["data"], df["indice_alerta"],
+       color=df["nivel_alerta"].map({"normal": "#999", "atenção": "#ff7f00", "crítico": "#e31a1c"}),
+       width=25)
+ax.axhline(2, ls="--", c="r"); ax.set_title("Índice de alerta mensal (média de z-scores)")
+plt.tight_layout()
+plt.savefig(f"{PASTA_SAIDA}/05_indice_alerta.png", dpi=150)
+plt.close()
+
+# %% 7. (OPCIONAL) PYSPARK -----------------------------------------------------
+etapa("7. (opcional) pyspark")
+# Mesma agregação em Spark, para demonstrar processamento distribuído.
+T_SPARK = None
+try:
+    from pyspark.sql import SparkSession, functions as F
+    spark = SparkSession.builder.appName("ViolenciaNiteroi").getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")          # silencia os logs do Spark
+    sdf = spark.createDataFrame(df[["data", "violencia_domestica_proxy"]].assign(
+        ano=df["data"].dt.year).drop(columns="data"))
+    T_SPARK = (sdf.groupBy("ano").agg(F.mean("violencia_domestica_proxy").alias("Média"),
+                                     F.stddev("violencia_domestica_proxy").alias("Desvio padrão"))
+                  .orderBy("ano").toPandas().rename(columns={"ano": "Ano"}).set_index("Ano").round(2))
+    spark.stop()
+    log("PySpark executado (resultado na Tabela 7).")
+except Exception as e:      # sem pyspark/Java instalado: etapa opcional
+    log(f"PySpark ignorado ({type(e).__name__}) - etapa opcional.")
+
+# %% 8. TABELAS FINAIS ORGANIZADAS --------------------------------------------
+etapa("8. Tabelas finais organizadas")
+NOMES = {"lesao_corporal": "Lesão corporal dolosa", "ameaca": "Ameaça", "estupro": "Estupro",
+         "homicidio_doloso": "Homicídio doloso", "feminicidio": "Feminicídio",
+         "violencia_domestica_proxy": "Violência doméstica (proxy)"}
+
+
+# Cores das tabelas. O texto é sempre escuro sobre fundo
+# claro, para ficar legível também no tema escuro do Colab.
+COR_CABECALHO = "#4a2c7a"     # cabeçalho e coluna de índice
+COR_LINHA_PAR = "#e9e1f5"     # linhas pares
+COR_LINHA_IMPAR = "#ffffff"   # linhas ímpares
+
+
+def fmt(v):
+    """Formata número no padrão brasileiro (1.234,56); inteiros sem casas decimais."""
+    if isinstance(v, (bool, np.bool_)) or isinstance(v, str):
+        return str(v)
+    if pd.isna(v):
+        return "-"
+    if float(v).is_integer():
+        return f"{int(v):,}".replace(",", ".")
+    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_p(v):
+    """p-valor: notação científica quando muito pequeno."""
+    return f"{v:.2e}".replace(".", ",") if v < 0.001 else f"{v:.4f}".replace(".", ",")
+
+
+# Tabela 1 - Estatísticas descritivas (uma linha por indicador)
+t1 = desc[["count", "mean", "std", "variancia", "coef_variacao_%", "min", "25%", "50%", "75%", "max"]].copy()
+t1.columns = ["N meses", "Média", "Desvio padrão", "Variância", "CV (%)", "Mínimo", "Q1", "Mediana", "Q3", "Máximo"]
+t1.index = [NOMES[i] for i in t1.index]
+
+# Tabela 2 - Outliers por indicador
+t2 = pd.DataFrame(resumo_out)
+t2["indicador"] = t2["indicador"].map(NOMES)
+t2.columns = ["Indicador", "Outliers (IQR)", "Outliers (z-score > 3)", "Observação"]
+
+# Tabela 3 - Regressões lineares simples
+t3 = pd.DataFrame(RESULTADOS_REG)
+t3["p-valor"] = t3["p-valor"].map(fmt_p)
+t3["R²"] = t3["R²"].map(lambda v: f"{v:.3f}".replace(".", ","))
+t3["Inclinação (a)"] = t3["Inclinação (a)"].map(lambda v: f"{v:.4f}".replace(".", ","))
+t3["Intercepto (b)"] = t3["Intercepto (b)"].map(lambda v: f"{v:.2f}".replace(".", ","))
+
+# Tabela 4 - Níveis de alerta (resumo) e, abaixo, os meses críticos
+t4a = df["nivel_alerta"].value_counts().reindex(["normal", "atenção", "crítico"]).fillna(0).astype(int)
+t4a = t4a.rename_axis("Nível de alerta").reset_index(name="Nº de meses")
+t4 = criticos.copy()
+t4["data"] = t4["data"].dt.strftime("%m/%Y")
+t4 = t4.rename(columns={**NOMES, "data": "Mês/Ano", "indice_alerta": "Índice de alerta"})
+
+# Tabela 5 - Desvio padrão por ano
+t5 = dp_ano.rename(columns={**NOMES, "meses": "Meses"})
+t5.index.name = "Ano"
+t5.columns = [c.replace("Violência doméstica (proxy)", "Viol. dom.").replace(" dolosa", "")
+              .replace("Homicídio doloso", "Homicídio") for c in t5.columns]
+
+# (nome da aba, título, tabela, mostrar índice?)
+TABELAS = {
+    "1_Descritivas": ("Tabela 1 - Estatísticas descritivas por indicador", t1, True),
+    "2_Outliers": ("Tabela 2 - Outliers por indicador (boxplot/IQR e z-score)", t2, False),
+    "3_Regressao": ("Tabela 3 - Regressão linear simples (y = a·x + b)", t3, False),
+    "4a_Niveis_alerta": ("Tabela 4a - Meses por nível de alerta", t4a, False),
+    "4b_Meses_criticos": ("Tabela 4b - Meses críticos (índice de alerta > 2)", t4, False),
+    "5_DesvioPadrao_Ano": ("Tabela 5 - Desvio padrão por ano (Meses < 12 = ano incompleto)", t5, True),
+}
+if T_SPARK is not None:
+    TABELAS["7_PySpark_Ano"] = ("Tabela 7 - Média e desvio padrão por ano (PySpark, violência doméstica proxy)", T_SPARK, True)
+if "feminicidio" in df.columns:
+    TABELAS["6_Feminicidio_Ano"] = ("Tabela 6 - Feminicídios por ano", fem_ano, True)
+
+# --- exibição: tabela HTML estilizada no Colab/Jupyter; texto alinhado no terminal ---
+try:
+    from IPython import get_ipython
+    EM_NOTEBOOK = get_ipython() is not None and get_ipython().__class__.__name__ in ("ZMQInteractiveShell", "Shell")
+except ImportError:
+    EM_NOTEBOOK = False
+
+
+def como_texto(tab, com_indice):
+    """Converte a tabela em texto já formatado (números no padrão brasileiro)."""
+    out = tab.apply(lambda col: col.map(fmt)) if len(tab) else tab.copy()
+    return out if com_indice else out.reset_index(drop=True)
+
+
+def mostrar(titulo, tab, com_indice):
+    txt = como_texto(tab, com_indice)
+    if len(tab) == 0:
+        txt = pd.DataFrame({"": ["(nenhum registro)"]})
+    if EM_NOTEBOOK:
+        from IPython.display import display, HTML
+        estilo = [
+            {"selector": "caption", "props": "caption-side: top; font-weight: bold; font-size: 14px; "
+                                             "text-align: left; padding: 6px 0;"},
+            {"selector": "th", "props": f"background-color: {COR_CABECALHO}; color: #ffffff; "
+                                        "padding: 4px 10px; text-align: center;"},
+            {"selector": "td", "props": f"background-color: {COR_LINHA_IMPAR}; color: #1f1f1f; "
+                                        "padding: 4px 10px; border-bottom: 1px solid #cfc6e0;"},
+            {"selector": "tbody tr:nth-child(even) td", "props": f"background-color: {COR_LINHA_PAR};"},
+        ]
+        sty = txt.style.set_caption(titulo).set_table_styles(estilo).set_properties(**{"text-align": "right"})
+        display(sty if com_indice else sty.hide(axis="index"))
+    else:
+        print("\n" + titulo + "\n" + "-" * len(titulo))
+        print(txt.to_string(index=com_indice, justify="center"))
+
+
+for nome, (titulo, tab, com_indice) in TABELAS.items():
+    mostrar(titulo, tab, com_indice)
+
+# %% 9. EXPORTAÇÃO -------------------------------------------------------------
+etapa("9. Exportação")
+df.to_csv(f"{PASTA_SAIDA}/base_niteroi_tratada.csv", index=False)
+try:   # um único Excel com uma aba por tabela (cabeçalho em negrito, colunas ajustadas)
+    from openpyxl.styles import Font, PatternFill
+    with pd.ExcelWriter(f"{PASTA_SAIDA}/resultados_niteroi.xlsx", engine="openpyxl") as xls:
+        for nome, (titulo, tab, com_indice) in TABELAS.items():
+            tab.to_excel(xls, sheet_name=nome[:31], index=com_indice)
+            ws = xls.sheets[nome[:31]]
+            for cel in ws[1]:
+                cel.font = Font(bold=True, color="FFFFFF")
+                cel.fill = PatternFill("solid", fgColor=COR_CABECALHO.lstrip("#"))
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = min(
+                    max(len(str(c.value)) if c.value is not None else 0 for c in col) + 3, 45)
+except ImportError:   # sem openpyxl: salva um CSV por tabela
+    for nome, (titulo, tab, com_indice) in TABELAS.items():
+        tab.to_csv(f"{PASTA_SAIDA}/tabela_{nome}.csv", index=com_indice)
+etapa("Concluído")
+log("Arquivos salvos em: " + os.path.abspath(PASTA_SAIDA))
